@@ -6,12 +6,11 @@ import {
   NotFoundException,
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { NotFoundError } from 'rxjs';
 import { PaginationDto } from 'src/common/dto/pagination.dto';
-import { Repository } from 'typeorm';
+import { DataSource, Repository } from 'typeorm';
 import { CreateProductDto } from './dto/create-product.dto';
 import { UpdateProductDto } from './dto/update-product.dto';
-import { Product } from './entities/product.entity';
+import { Product, ProductImage } from './entities';
 import { validate as isUUID } from 'uuid';
 
 @Injectable()
@@ -20,23 +19,39 @@ export class ProductsService {
   constructor(
     @InjectRepository(Product)
     private readonly productRepository: Repository<Product>,
+    @InjectRepository(ProductImage)
+    private readonly productImagesRepository: Repository<ProductImage>,
+    private readonly dataSource: DataSource,
   ) {}
   async create(createProductDto: CreateProductDto) {
     try {
-      const product = this.productRepository.create(createProductDto);
+      const { images = [], ...productDetails } = createProductDto;
+      const product = this.productRepository.create({
+        ...productDetails,
+        images: images.map((url) =>
+          this.productImagesRepository.create({ url }),
+        ),
+      });
       await this.productRepository.save(product);
-      return product;
+      return { ...product, images };
     } catch (error) {
       this.handleDBExceptions(error);
     }
   }
 
-  findAll({ limit = 10, offset = 0 }: PaginationDto) {
-    return this.productRepository.find({
+  async findAll({ limit = 10, offset = 0 }: PaginationDto) {
+    const products = await this.productRepository.find({
       take: limit,
       skip: offset,
-      //TODO: relations
+      relations: {
+        images: true,
+      },
     });
+
+    return products.map((product) => ({
+      ...product,
+      images: product.images.map(({ url }) => url),
+    }));
   }
 
   async findOne(term: string) {
@@ -46,12 +61,13 @@ export class ProductsService {
         id: term,
       });
     } else {
-      const queryBuilder = this.productRepository.createQueryBuilder();
+      const queryBuilder = this.productRepository.createQueryBuilder('prod');
       product = await queryBuilder
         .where('UPPER(title) =:title or slug =:slug', {
           title: term.toUpperCase(),
           slug: term.toLowerCase(),
         })
+        .leftJoinAndSelect('prod.images', 'prodImages')
         .getOne();
     }
 
@@ -61,14 +77,23 @@ export class ProductsService {
     return product;
   }
 
+  async findOnePlain(term: string) {
+    const { images = [], ...restProduct } = await this.findOne(term);
+    return { ...restProduct, images: images.map(({ url }) => url) };
+  }
+
   async update(id: string, updateProductDto: UpdateProductDto) {
+    const { images, ...toUpdate } = updateProductDto;
     const product = await this.productRepository.preload({
       id,
-      ...updateProductDto,
+      ...toUpdate,
     });
 
     if (!product)
       throw new NotFoundException(`Product with id ${id} does not exist `);
+
+    // create query runner
+    const queryRunner = this.dataSource.createQueryRunner();
 
     try {
       return await this.productRepository.save(product);
